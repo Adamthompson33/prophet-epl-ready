@@ -1,0 +1,89 @@
+{
+  "description": "Column mapping from feature pipeline to evaluator schema",
+  "version": "1.0",
+  
+  "pipeline_columns": [
+    "fixture_id",
+    "match_date", 
+    "venue",
+    "home_team",
+    "away_team"
+  ],
+  
+  "column_mapping": {
+    "fixture_id": "match_id",
+    "match_date": "date",
+    "home_team": "home",
+    "away_team": "away",
+    "weather_temperature_c": "temp",
+    "weather_precipitation_mm": "precip",
+    "weather_wind_speed_m_s": "wind",
+    "weather_humidity_percent": "humidity",
+    "weather_is_cold": "is_cold",
+    "weather_is_wet": "is_rain",
+    "weather_is_windy": "is_windy",
+    "weather_is_warm": "is_warm",
+    "weather_heavy_rain": "heavy_rain",
+    "home_search_count": "home_news_count",
+    "away_search_count": "away_news_count",
+    "home_has_news": "home_has_news",
+    "away_has_news": "away_has_news"
+  },
+  
+  "drop_columns": [
+    "home_team_logo",
+    "away_team_logo", 
+    "home_search_text",
+    "away_search_text",
+    "home_search_snippets_json",
+    "away_search_snippets_json",
+    "fixture_teams_home_logo",
+    "fixture_teams_away_logo",
+    "fixture_league_logo",
+    "fixture_league_flag",
+    "weather_icon",
+    "weather_description",
+    "forecast_time",
+    "city"
+  ],
+  
+  "derive_columns": {
+    "goal_diff": "home_goals - away_goals",
+    "total_goals": "home_goals + away_goals",
+    "home_win": "home_goals > away_goals",
+    "away_win": "away_goals > home_goals", 
+    "is_draw": "home_goals == away_goals",
+    "home_xg_estimate": "calculate from team strengths",
+    "away_xg_estimate": "calculate from team strengths"
+  },
+  
+  "evaluator_expected_columns": [
+    "match_id",
+    "date",
+    "home",
+    "away",
+    "home_goals",
+    "away_goals",
+    "temp",
+    "precip", 
+    "wind",
+    "is_cold",
+    "is_rain",
+    "is_windy",
+    "home_news_count",
+    "away_news_count",
+    "home_xg",
+    "away_xg",
+    "home_win",
+    "away_win",
+    "is_draw"
+  ],
+  
+  "notes": {
+    "home_goals": "Use fixture_goals_home from API-Football",
+    "away_goals": "Use fixture_goals_away from API-Football",
+    "home_xg": "Need to calculate from Dixon-Coles model output",
+    "away_xg": "Need to calculate from Dixon-Coles model output",
+    "target": "This mapping converts pipeline output to evaluator input format"
+  }
+}
