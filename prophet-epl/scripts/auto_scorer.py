@@ -331,6 +331,9 @@ def load_pending_simulations() -> List[dict]:
     for path in sorted(RUNS_DIR.glob("epl_*.json")):
         with open(path) as f:
             sim = json.load(f)
+        # Skip old-format files (e.g. from epl_market_pipeline.py)
+        if "fixture_id" not in sim:
+            continue
         # Check if already scored
         scored_path = DATA_DIR / f"epl_{sim['fixture_id']}.json"
         if not scored_path.exists():
@@ -474,11 +477,11 @@ def cmd_next():
 
 def cmd_run(limit: int = 3, fixtures: List[dict] = None, dry: bool = False):
     if fixtures is None:
-        fixtures = get_upcoming_fixtures(limit=limit)
+        all_fixtures = get_upcoming_fixtures(limit=50)
 
     # Filter out already-simulated
     new_fixtures = []
-    for f in fixtures:
+    for f in all_fixtures:
         fid = f.get("fixture", {}).get("id")
         if get_simulation_file(fid).exists():
             print(f"  Skipping {fid} — already simulated")
@@ -562,13 +565,11 @@ def cmd_collect():
 
 def main():
     parser = argparse.ArgumentParser(description="EPL MiroFish Auto-Scorer")
-    sub = parser.add_subparsers(dest="cmd")
-
-    sub.add_argument("cmd", nargs="?", default="status")
-    sub.add_argument("id", nargs="?", type=int, help="Fixture ID")
-    sub.add_argument("--limit", "-n", type=int, default=3, help="Number of fixtures to simulate")
-    sub.add_argument("--dry", action="store_true", help="Dry run")
-    sub.add_argument("--status", action="store_true", help="Show calibration report")
+    parser.add_argument("cmd", nargs="?", default="status", help="Command: next, run, score, collect, status")
+    parser.add_argument("id", nargs="?", type=int, help="Fixture ID")
+    parser.add_argument("--limit", "-n", type=int, default=3, help="Number of fixtures to simulate")
+    parser.add_argument("--dry", action="store_true", help="Dry run")
+    parser.add_argument("--status", action="store_true", help="Show calibration report")
 
     args = parser.parse_args()
     cmd = args.cmd
