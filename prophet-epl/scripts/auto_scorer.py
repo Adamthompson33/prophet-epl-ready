@@ -195,9 +195,139 @@ def get_fixture_result(fixture_id: int) -> Optional[dict]:
     }
 
 
+# ── MindSpider: Match Intelligence ─────────────────────────────────────────
+
+class MatchIntelligence:
+    """MindSpider-style pre-match intelligence gatherer.
+    Gathers real news, injury reports, and fan sentiment before simulation."""
+
+    def __init__(self):
+        self.cache_dir = DATA_DIR / "intelligence"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; EPL-MiroFish/1.0)"})
+
+    def gather(self, home: str, away: str, match_date: str) -> dict:
+        """Gather all available intelligence before running agents."""
+        intel = {
+            "match": f"{home} vs {away}",
+            "match_date": match_date,
+            "gathered_at": datetime.now().isoformat(),
+            "news": [],
+            "reddit": [],
+        }
+        print(f"  📡 Gathering intelligence: {home} vs {away}")
+
+        # 1. Search for news via DuckDuckGo (no API key)
+        intel["news"] = self._search_news(home, away)
+
+        # 2. Reddit sentiment
+        intel["reddit"] = self._search_reddit(home, away)
+
+        if intel["news"] or intel["reddit"]:
+            print(f"  📡 Got {len(intel['news'])} news items, {len(intel['reddit'])} reddit posts")
+        else:
+            print(f"  📡 No external intelligence found — using standard analysis")
+
+        return intel
+
+    def _search_news(self, home: str, away: str) -> list:
+        """Search for recent team news via DuckDuckGo."""
+        results = []
+        month = datetime.now().strftime("%B %Y")
+        queries = [
+            f'"{home}" team news injury lineup {month}',
+            f'"{away}" team news injury lineup {month}',
+            f'"{home} vs {away}" preview {month}',
+        ]
+        for query in queries:
+            try:
+                encoded = requests.utils.quote(query)
+                url = f"https://html.duckduckgo.com/html/?q={encoded}"
+                resp = self.session.get(url, timeout=10)
+                if resp.status_code == 200:
+                    text = resp.text
+                    import re as _re
+                    # Try multiple DDG HTML formats
+                    titles = (
+                        _re.findall(r'<a class="result__a"[^>]*href[^>]*>([^<]+)</a>', text) or
+                        _re.findall(r'class="result-title"[^>]*>([^<]+)<', text) or
+                        _re.findall(r'<h2[^>]*>([^<]+)<', text)
+                    )
+                    snippets = _re.findall(
+                        r'class="result__snippet"[^>]*>([^<]+)<', text
+                    ) or _re.findall(r'<span class="result__description"[^>]*>([^<]+)<', text)
+
+                    for i, title in enumerate(titles[:4]):
+                        clean_title = _re.sub(r'<[^>]+>', '', title).strip()
+                        clean_snippet = (
+                            _re.sub(r'<[^>]+>', '', snippets[i]).strip()
+                            if i < len(snippets) else ""
+                        )
+                        if clean_title and len(clean_title) > 15:
+                            results.append({
+                                "query": query[:60],
+                                "title": clean_title[:200],
+                                "snippet": clean_snippet[:200],
+                            })
+                        if len(results) >= 5:
+                            break
+                if len(results) >= 5:
+                    break
+            except Exception:
+                pass
+        return results[:5]
+
+    def _search_reddit(self, home: str, away: str) -> list:
+        """Search Reddit for fan sentiment."""
+        subreddits = ['soccer', 'FantasyPL', 'sportsbook', 'PremierLeague']
+        results = []
+        for sub in subreddits:
+            try:
+                url = f"https://www.reddit.com/r/{sub}/search.json?q={home}+{away}&restrict_sr=1&sort=new&limit=5"
+                resp = self.session.get(url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    posts = data.get('data', {}).get('children', [])
+                    for post in posts[:3]:
+                        p = post['data']
+                        results.append({
+                            "subreddit": sub,
+                            "title": p.get('title', '')[:150],
+                            "score": p.get('score', 0),
+                            "num_comments": p.get('num_comments', 0),
+                        })
+            except Exception:
+                pass
+        return results[:5]
+
+    def format_for_agents(self, intel: dict) -> str:
+        """Format intelligence into a string LLM agents can use."""
+        sections = []
+
+        if intel.get("news"):
+            sections.append("=== RECENT TEAM NEWS ===")
+            for item in intel["news"][:4]:
+                if item.get("title"):
+                    sections.append(f"  • {item['title'][:200]}")
+                if item.get("snippet"):
+                    sections.append(f"    \"{item['snippet'][:150]}\"")
+
+        if intel.get("reddit"):
+            sections.append("\n=== FAN DISCUSSION (Reddit) ===")
+            for post in intel["reddit"][:4]:
+                sections.append(f"  • [{post['subreddit']}] {post['title'][:120]}")
+                sections.append(f"    (↑{post['score']}, {post['num_comments']} comments)")
+
+        if not sections:
+            return ""
+
+        return "\n".join(sections)
+
+
 # ── Simulation ──────────────────────────────────────────────────────────────
 
-def build_actors_context(fixture: dict) -> str:
+def build_actors_context(fixture: dict, intel_text: str = "") -> str:
     """Build context string for all actors."""
     teams = fixture.get("teams", {})
     home = teams.get("home", {}).get("name", "Unknown")
@@ -207,11 +337,15 @@ def build_actors_context(fixture: dict) -> str:
     date = fix.get("date", "")[:10]
     league = fixture.get("league", {}).get("name", "Premier League")
 
+    intel_block = f"""
+PRE-MATCH INTELLIGENCE:
+{intel_text}
+""" if intel_text else ""
+
     context = f"""MATCH: {home} vs {away}
 VENUE: {venue}
 DATE: {date}
-LEAGUE: {league}
-
+LEAGUE: {league}{intel_block}
 You are one of several betting market participants. Output EXACTLY the format specified.
 """
     return context
@@ -223,11 +357,16 @@ def run_simulation(fixture: dict) -> Optional[dict]:
     home = teams.get("home", {}).get("name", "Unknown")
     away = teams.get("away", {}).get("name", "Unknown")
     fixture_id = fixture.get("fixture", {}).get("id", "unknown")
+    match_date = fixture.get("fixture", {}).get("date", "")[:10]
+
+    # Phase 1: MindSpider intelligence gathering
+    intel = MatchIntelligence().gather(home, away, match_date)
+    intel_text = MatchIntelligence().format_for_agents(intel)
 
     print(f"  Running 8 actors for {home} vs {away}...")
 
     actor_results = []
-    base_context = build_actors_context(fixture)
+    base_context = build_actors_context(fixture, intel_text)
 
     for actor in ACTORS:
         actor_name = actor["name"]
@@ -296,6 +435,7 @@ Where XX are integers summing to 100. Be realistic and consistent with your role
         "away_prob": round(avg_away, 1),
         "pred": "HOME" if avg_home >= avg_draw and avg_home >= avg_away else ("DRAW" if avg_draw >= avg_away else "AWAY"),
         "actor_results": actor_results,
+        "intel": intel,
         "timestamp": datetime.now().isoformat(),
     }
 
