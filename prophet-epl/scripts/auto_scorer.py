@@ -44,9 +44,9 @@ if PROJ_ENV.exists():
                 os.environ.setdefault(k.strip(), v.strip())
 
 # ── Keys ────────────────────────────────────────────────────────────────────
-FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY", "4d5a35987e7d4c579c8e0cf47458f4bc")
+FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY", "")
 FOOTBALL_DATA_URL = "https://api.football-data.org/v4"
-CODING_PLAN_KEY = os.environ.get("CODING_PLAN_KEY", "sk-sp-d69279c539fb4c20a36aa9fd9d1759d1")
+CODING_PLAN_KEY = os.environ.get("CODING_PLAN_KEY", "")
 CODING_PLAN_URL = "https://coding-intl.dashscope.aliyuncs.com/v1"
 SIM_MODEL = os.environ.get("SIM_MODEL", "MiniMax-M2.5")
 
@@ -329,11 +329,18 @@ def load_pending_simulations() -> List[dict]:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     pending = []
     for path in sorted(RUNS_DIR.glob("epl_*.json")):
-        with open(path) as f:
-            sim = json.load(f)
-        # Skip old-format files (e.g. from epl_market_pipeline.py)
-        if "fixture_id" not in sim:
+        try:
+            with open(path) as f:
+                sim = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"  Skipping unreadable simulation file {path.name}: {e}")
             continue
+
+        # Skip old/invalid format files (e.g. from epl_market_pipeline.py)
+        required = {"fixture_id", "home_prob", "draw_prob", "away_prob", "pred", "home", "away"}
+        if not required.issubset(sim.keys()):
+            continue
+
         # Check if already scored
         scored_path = DATA_DIR / f"epl_{sim['fixture_id']}.json"
         if not scored_path.exists():
@@ -363,19 +370,30 @@ def score_simulation(sim: dict, actual: dict) -> dict:
     actual_res = actual["actual"].upper()
     correct = pred == actual_res
 
-    pH = sim["home_prob"] / 100
-    pD = sim["draw_prob"] / 100
-    pA = sim["away_prob"] / 100
+    pH = float(sim["home_prob"]) / 100.0
+    pD = float(sim["draw_prob"]) / 100.0
+    pA = float(sim["away_prob"]) / 100.0
 
-    # Log loss
-    if pred == "HOME":
-        log_loss = -math.log(pH + 1e-15)
-    elif pred == "DRAW":
-        log_loss = -math.log(pD + 1e-15)
+    # Guard against malformed values and renormalize to a proper distribution
+    pH = min(1.0, max(0.0, pH))
+    pD = min(1.0, max(0.0, pD))
+    pA = min(1.0, max(0.0, pA))
+    total = pH + pD + pA
+    if total <= 0:
+        pH = pD = pA = 1.0 / 3.0
     else:
-        log_loss = -math.log(pA + 1e-15)
+        pH, pD, pA = pH / total, pD / total, pA / total
 
-    # Brier score (probability assigned to correct outcome)
+    # Proper log loss: probability assigned to the actual outcome
+    if actual_res == "HOME":
+        p_actual = pH
+    elif actual_res == "DRAW":
+        p_actual = pD
+    else:
+        p_actual = pA
+    log_loss = -math.log(p_actual + 1e-15)
+
+    # Brier score (proper multiclass formulation)
     if actual_res == "HOME":
         brier = (1 - pH) ** 2 + pD ** 2 + pA ** 2
     elif actual_res == "DRAW":
@@ -476,8 +494,7 @@ def cmd_next():
 
 
 def cmd_run(limit: int = 3, fixtures: List[dict] = None, dry: bool = False):
-    if fixtures is None:
-        all_fixtures = get_upcoming_fixtures(limit=50)
+    all_fixtures = fixtures if fixtures is not None else get_upcoming_fixtures(limit=50)
 
     # Filter out already-simulated
     new_fixtures = []
@@ -563,16 +580,30 @@ def cmd_collect():
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def _missing_env_for(cmd: str) -> List[str]:
+    missing = []
+    if cmd in {"next", "run", "score", "collect"} and not FOOTBALL_DATA_KEY:
+        missing.append("FOOTBALL_DATA_KEY")
+    if cmd == "run" and not CODING_PLAN_KEY:
+        missing.append("CODING_PLAN_KEY")
+    return missing
+
+
 def main():
     parser = argparse.ArgumentParser(description="EPL MiroFish Auto-Scorer")
     parser.add_argument("cmd", nargs="?", default="status", help="Command: next, run, score, collect, status")
     parser.add_argument("id", nargs="?", type=int, help="Fixture ID")
     parser.add_argument("--limit", "-n", type=int, default=3, help="Number of fixtures to simulate")
     parser.add_argument("--dry", action="store_true", help="Dry run")
-    parser.add_argument("--status", action="store_true", help="Show calibration report")
 
     args = parser.parse_args()
     cmd = args.cmd
+
+    missing = _missing_env_for(cmd)
+    if missing:
+        print(f"Missing required env var(s) for '{cmd}': {', '.join(missing)}")
+        print("Set them in ~/.hermes/.env or ~/prophet-epl-ready/.env and retry.")
+        sys.exit(2)
 
     if cmd == "next":
         cmd_next()
