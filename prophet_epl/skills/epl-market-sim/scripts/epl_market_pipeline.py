@@ -16,26 +16,34 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
 import time
+import re
 
-# Load .env file if available (look in project root)
-env_path = Path("/home/adamt/prophet-epl-ready/.env")
-if env_path.exists():
-    with open(env_path) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, val = line.split("=", 1)
-                os.environ.setdefault(key, val)
 
-# Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        os.environ.setdefault(key.strip(), val.strip())
 
-# Configuration
-SKILL_DIR = PROJECT_ROOT / "skills" / "epl-market-sim"
+
+# Project layout
+SCRIPT_PATH = Path(__file__).resolve()
+SKILL_DIR = SCRIPT_PATH.parents[1]  # .../prophet_epl/skills/epl-market-sim
+PROJECT_ROOT = SCRIPT_PATH.parents[4]  # .../prophet-epl-ready
 CONFIG_DIR = SKILL_DIR / "configs"
 DATA_DIR = Path.home() / ".hermes" / "data" / "epl-market-sim"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Load envs from portable locations (do not overwrite existing env vars)
+load_env_file(PROJECT_ROOT / ".env")
+load_env_file(Path.cwd() / ".env")
+
+# Add project root to path
+sys.path.insert(0, str(PROJECT_ROOT))
 
 # API Keys (from environment)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -91,36 +99,35 @@ def health_check() -> bool:
     # Check API keys
     print("\n[API Keys]")
     if OPENROUTER_API_KEY:
-        print(f"  ✓ OpenRouter: {OPENROUTER_API_KEY[:20]}...")
+        print("  ✓ OpenRouter: set")
     elif OLLAMA_BASE_URL:
         print(f"  ✓ Ollama: {OLLAMA_BASE_URL}")
     else:
         issues.append("No LLM provider: Set OPENROUTER_API_KEY or OLLAMA_BASE_URL")
-    
+
     if API_FOOTBALL_KEY:
-        print(f"  ✓ API-Football: {API_FOOTBALL_KEY[:20]}...")
+        print("  ✓ API-Football: set")
     else:
         print("  ⚠ API-Football: Not set (optional)")
-    
+
     if WEATHER_API_KEY:
-        print(f"  ✓ Weather API: {WEATHER_API_KEY[:20]}...")
+        print("  ✓ Weather API: set")
     else:
         print("  ⚠ Weather API: Not set (optional)")
-    
+
     if BRAVE_SEARCH_KEY:
-        print(f"  ✓ Brave Search: {BRAVE_SEARCH_KEY[:20]}...")
+        print("  ✓ Brave Search: set")
     else:
         print("  ⚠ Brave Search: Not set (optional)")
-    
-    # Check MiroFish
+
+    # Check MiroFish (optional for direct-LLM fallback mode)
     print("\n[MiroFish]")
     mirofish_status = check_mirofish_health()
     if mirofish_status["status"] == "healthy":
         print(f"  ✓ MiroFish: Reachable at {MIROFISH_URL}")
     else:
-        issues.append(f"MiroFish unreachable at {MIROFISH_URL}")
-        print(f"  ✗ MiroFish: Not reachable at {MIROFISH_URL}")
-        print(f"    Run: docker run -d -p 3000:3000 -p 5001:5001 ghcr.io/666ghj/mirofish")
+        print(f"  ⚠ MiroFish: Not reachable at {MIROFISH_URL} (direct LLM mode can still run)")
+        print("    Run: docker run -d -p 3000:3000 -p 5001:5001 ghcr.io/666ghj/mirofish")
     
     if issues:
         print("\n❌ Issues found:")
@@ -307,6 +314,48 @@ def generate_seed_packet(sport: str, match_data: Dict, weather: Dict, news: Dict
     }
 
 
+def _parse_percent_value(value) -> Optional[float]:
+    """Parse percentage-like values (e.g., 42, '42%', '42.5')."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", value)
+        if m:
+            return float(m.group(0))
+    return None
+
+
+def _extract_three_way_probs(response: Dict) -> Optional[Dict[str, float]]:
+    """Extract p(Home)/p(Draw)/p(Away) from structured JSON or free-form text."""
+    # 1) Direct structured keys first
+    direct_home = _parse_percent_value(response.get("p(Home)"))
+    direct_draw = _parse_percent_value(response.get("p(Draw)"))
+    direct_away = _parse_percent_value(response.get("p(Away)"))
+    if None not in (direct_home, direct_draw, direct_away):
+        return {"home": direct_home, "draw": direct_draw, "away": direct_away}
+
+    # 2) Parse from raw text payload
+    text_to_parse = " ".join([
+        str(response.get("raw_response", "")),
+        str(response),
+    ])
+
+    home_match = re.search(r"p\(Home\)[^0-9-]*(-?\d+(?:\.\d+)?)%?", text_to_parse, re.IGNORECASE)
+    draw_match = re.search(r"p\(Draw\)[^0-9-]*(-?\d+(?:\.\d+)?)%?", text_to_parse, re.IGNORECASE)
+    away_match = re.search(r"p\(Away\)[^0-9-]*(-?\d+(?:\.\d+)?)%?", text_to_parse, re.IGNORECASE)
+
+    if not (home_match and draw_match and away_match):
+        return None
+
+    return {
+        "home": float(home_match.group(1)),
+        "draw": float(draw_match.group(1)),
+        "away": float(away_match.group(1)),
+    }
+
+
 def run_mirofish_simulation(seed_packet: Dict, config: Dict) -> Dict:
     """
     Run multi-agent simulation directly via OpenRouter.
@@ -405,63 +454,82 @@ p(Away): ZZ%"""
     if not actor_results:
         return {"error": "No actor responses received"}
     
-    # Calculate consensus - different for EPL vs MMA
-    if sport == "epl":
-        # EPL: Parse 3-way probabilities
-        home_probs = []
-        draw_probs = []
-        away_probs = []
-        
+    # Calculate consensus - EPL/football uses 3-way probability averaging.
+    if sport in {"epl", "football"}:
+        home_probs: List[float] = []
+        draw_probs: List[float] = []
+        away_probs: List[float] = []
+        valid_actor_count = 0
+
         for ar in actor_results:
             resp = ar.get("response", {})
-            # Try to parse probability format - check both raw and parsed
-            raw = str(resp.get("raw_response", ""))
-            parsed = str(resp)
-            
-            # Combine both for parsing
-            text_to_parse = raw + " " + parsed
-            
-            import re
-            home_match = re.search(r'p\(Home\)[^0-9]*(\d+)%?', text_to_parse, re.IGNORECASE)
-            draw_match = re.search(r'p\(Draw\)[^0-9]*(\d+)%?', text_to_parse, re.IGNORECASE)
-            away_match = re.search(r'p\(Away\)[^0-9]*(\d+)%?', text_to_parse, re.IGNORECASE)
-            
-            if home_match and draw_match and away_match:
-                home_probs.append(int(home_match.group(1)))
-                draw_probs.append(int(draw_match.group(1)))
-                away_probs.append(int(away_match.group(1)))
-            else:
-                # Debug: show what we got
-                print(f"    DEBUG: Could not parse: {text_to_parse[:150]}...")
-        
-        if home_probs:
-            avg_home = sum(home_probs) / len(home_probs)
-            avg_draw = sum(draw_probs) / len(draw_probs)
-            avg_away = sum(away_probs) / len(away_probs)
-            
-            print(f"    Raw probs: home={home_probs}, draw={draw_probs}, away={away_probs}")
-            
-            # Renormalize to sum to 100
-            total = avg_home + avg_draw + avg_away
-            if total > 0:
-                avg_home = (avg_home / total) * 100
-                avg_draw = (avg_draw / total) * 100
-                avg_away = (avg_away / total) * 100
-            
+            parsed_probs = _extract_three_way_probs(resp)
+            if not parsed_probs:
+                print(f"    DEBUG: Could not parse 3-way probabilities from actor={ar.get('actor')}")
+                continue
+
+            home_probs.append(parsed_probs["home"])
+            draw_probs.append(parsed_probs["draw"])
+            away_probs.append(parsed_probs["away"])
+            valid_actor_count += 1
+
+        # Fail-closed if no valid 3-way agent outputs exist.
+        if valid_actor_count == 0:
             return {
-                "success": True,
+                "error": "No valid 3-way probability outputs",
                 "sport": sport,
-                "match": f"{home_team} vs {away_team}",
+                "agent_consensus": "fail_closed_no_valid_agent_probs",
+                "p_home": None,
+                "p_draw": None,
+                "p_away": None,
                 "actors": actor_results,
-                "probabilities": {
-                    "p(Home)": round(avg_home, 1),
-                    "p(Draw)": round(avg_draw, 1),
-                    "p(Away)": round(avg_away, 1)
-                },
-                "confidence": round(max(avg_home, avg_draw, avg_away) / 100, 2)
             }
-        else:
-            return {"error": "Could not parse probability outputs"}
+
+        avg_home = sum(home_probs) / valid_actor_count
+        avg_draw = sum(draw_probs) / valid_actor_count
+        avg_away = sum(away_probs) / valid_actor_count
+
+        print(f"    Raw probs: home={home_probs}, draw={draw_probs}, away={away_probs}")
+
+        # Renormalize to sum to 100 to account for imperfect agent totals.
+        total = avg_home + avg_draw + avg_away
+        if total <= 0:
+            return {
+                "error": "Invalid 3-way probability total",
+                "sport": sport,
+                "agent_consensus": "fail_closed_invalid_total",
+                "p_home": None,
+                "p_draw": None,
+                "p_away": None,
+                "actors": actor_results,
+            }
+
+        avg_home = (avg_home / total) * 100
+        avg_draw = (avg_draw / total) * 100
+        avg_away = (avg_away / total) * 100
+
+        p_home = round(avg_home, 4)
+        p_draw = round(avg_draw, 4)
+        # Force exact 100.0000 total after rounding to avoid drift.
+        p_away = round(100.0 - p_home - p_draw, 4)
+
+        return {
+            "success": True,
+            "sport": sport,
+            "match": f"{home_team} vs {away_team}",
+            "actors": actor_results,
+            "agent_consensus": "three_way_mean",
+            "valid_agent_count": valid_actor_count,
+            "p_home": p_home,
+            "p_draw": p_draw,
+            "p_away": p_away,
+            "probabilities": {
+                "p(Home)": p_home,
+                "p(Draw)": p_draw,
+                "p(Away)": p_away
+            },
+            "confidence": round(max(p_home, p_draw, p_away) / 100, 4)
+        }
     
     # MMA: Calculate consensus (fixed vote mapping)
     home_votes = 0
@@ -569,12 +637,20 @@ def analyze_line_movement(simulation_result: Dict, sport: str) -> Dict:
     if "error" in simulation_result:
         return simulation_result
     
-    # Check for new probability format (EPL)
-    if simulation_result.get("probabilities"):
+    # Check for numeric 3-way probability format (EPL/football)
+    if simulation_result.get("p_home") is not None and simulation_result.get("p_draw") is not None and simulation_result.get("p_away") is not None:
+        p_home = float(simulation_result.get("p_home", 0))
+        p_draw = float(simulation_result.get("p_draw", 0))
+        p_away = float(simulation_result.get("p_away", 0))
+    elif simulation_result.get("probabilities"):
         probs = simulation_result.get("probabilities", {})
-        p_home = probs.get("p(Home)", 0)
-        p_draw = probs.get("p(Draw)", 0)
-        p_away = probs.get("p(Away)", 0)
+        p_home = float(probs.get("p(Home)", 0))
+        p_draw = float(probs.get("p(Draw)", 0))
+        p_away = float(probs.get("p(Away)", 0))
+    else:
+        p_home = p_draw = p_away = None
+
+    if p_home is not None and p_draw is not None and p_away is not None:
         
         # Determine predicted outcome
         if p_home >= p_draw and p_home >= p_away:
